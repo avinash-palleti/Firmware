@@ -22,6 +22,7 @@ set(config_module_list
 	drivers/ll40ls
 	drivers/aerofc_adc
 	modules/sensors
+	modules/micrortps_bridge
 
 	#
 	# System commands
@@ -91,4 +92,13 @@ set(config_module_list
 	platforms/common
 	platforms/nuttx
 	platforms/nuttx/px4_layer
+)
+
+set(config_rtps_receive_topics
+	sensor_combined
+)
+
+set(config_rtps_send_topics
+	vehicle_command
+	optical_flow
 )
