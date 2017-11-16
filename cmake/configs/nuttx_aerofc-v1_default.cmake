@@ -23,6 +23,7 @@ set(config_module_list
 	drivers/aerofc_adc
 	modules/sensors
 	modules/micrortps_bridge
+	drivers/protocol_splitter
 
 	#
 	# System commands
