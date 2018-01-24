@@ -36,6 +36,8 @@
 #include <arpa/inet.h>
 #include <poll.h>
 
+#define MAX_BUFFER_SIZE 1024
+
 class Transport_node
 {
 public:

@@ -35,6 +35,7 @@
 #include <stdio.h>
 #include <errno.h>
 #include <sys/socket.h>
+#include <cstdlib>
 
 #include "microRTPS_transport.h"
 
@@ -223,18 +224,13 @@ ssize_t Transport_node::write(const uint8_t topic_ID, char buffer[], size_t leng
 	header.crc_h = (crc >> 8) & 0xff;
 	header.crc_l = crc & 0xff;
 
-	ssize_t len = node_write(&header, sizeof(header));
-
-	if (len != sizeof(header)) {
+	char buffer_sync[MAX_BUFFER_SIZE];
+	memmove(buffer_sync, &header, sizeof(header));
+	memmove(buffer_sync+sizeof(header), buffer, length);
+	ssize_t len = node_write(buffer_sync, length + sizeof(header));
+	if (len != ssize_t(length + sizeof(header))) {
 		goto err;
 	}
-
-	len = node_write(buffer, length);
-
-	if (len != ssize_t(length)) {
-		goto err;
-	}
-
 	return len + sizeof(header);
 
 err:
