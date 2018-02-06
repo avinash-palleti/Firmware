@@ -43,15 +43,23 @@
 #include <drivers/device/device.h>
 #include <px4_sem.hpp>
 #include <px4_log.h>
+#include <px4_getopt.h>
+#include <px4_module.h>
 
 #include <sys/ioctl.h>
 #include <unistd.h>
 #include <cstdint>
 #include <string.h>
+#include <arpa/inet.h>
+#include <pthread.h>
 
 class Mavlink2Dev;
 class RtpsDev;
 class ReadBuffer;
+class UDP_conn;
+void* t_send(void *);
+void* t_receive(void *);
+bool isRTPS(uint8_t *, ssize_t);
 
 extern "C" __EXPORT int protocol_splitter_main(int argc, char *argv[]);
 
@@ -64,9 +72,41 @@ struct StaticData {
 	ReadBuffer *read_buffer;
 };
 
+struct UdpPorts {
+	UDP_conn *mav_udp;
+	UDP_conn *rtps_udp;
+	UDP_conn *fcu_udp;
+};
+struct Header {
+	char marker[3];
+	uint8_t topic_ID;
+	uint8_t seq;
+	uint8_t payload_len_h;
+	uint8_t payload_len_l;
+	uint8_t crc_h;
+	uint8_t crc_l;
+};
+
+struct options {
+	enum class eTransports {
+		UART,
+		UDP
+	};
+	eTransports transport = options::eTransports::UART;
+	int mavlink_bind_port;
+	int mavlink_remote_port;
+	int rtps_bind_port;
+	int rtps_remote_port;
+	int fcu_bind_port;
+	int fcu_remote_port;
+	char device[64] = "/dev/ttyS1";
+};
+
 namespace
 {
 static StaticData *objects = nullptr;
+static UdpPorts *udpPorts = nullptr;
+static options _options;
 }
 
 class ReadBuffer
@@ -539,53 +579,348 @@ ssize_t RtpsDev::write(struct file *filp, const char *buffer, size_t buflen)
 	return ret;
 }
 
-int protocol_splitter_main(int argc, char *argv[])
+class UDP_conn
 {
-	if (argc < 2) {
-		goto out;
+public:
+	UDP_conn(uint16_t udp_port_recv, uint16_t udp_port_send);
+	~UDP_conn();
+
+	int init();
+	uint8_t close();
+	ssize_t read(void *buffer, size_t len);
+	ssize_t write(void *buffer, size_t len);
+protected:
+	int init_receiver(uint16_t upd_port);
+	int init_sender(uint16_t udp_port);
+	bool fds_OK();
+
+	int sender_fd;
+	int receiver_fd;	
+	uint16_t udp_port_recv;
+	uint16_t udp_port_send;
+	struct sockaddr_in sender_outaddr;
+	struct sockaddr_in receiver_inaddr;
+	struct sockaddr_in receiver_outaddr;
+};
+
+UDP_conn::UDP_conn(uint16_t _udp_port_recv, uint16_t _udp_port_send):
+	sender_fd(-1),
+	receiver_fd(-1),
+	udp_port_recv(_udp_port_recv),
+	udp_port_send(_udp_port_send)
+{
+}
+
+UDP_conn::~UDP_conn()
+{
+	close();
+}
+
+bool UDP_conn::fds_OK()
+{
+	return (-1 != sender_fd && -1 != receiver_fd);
+}
+
+int UDP_conn::init()
+{
+	if (0 > init_receiver(udp_port_recv) || 0 > init_sender(udp_port_send)) {
+		return -1;
 	}
 
-	/*
-	 * Start/load the driver.
-	 */
+	return 0;
+}
+
+
+int UDP_conn::init_receiver(uint16_t udp_port)
+{
+#ifndef __PX4_NUTTX
+	// udp socket data
+	memset((char *)&receiver_inaddr, 0, sizeof(receiver_inaddr));
+	receiver_inaddr.sin_family = AF_INET;
+	receiver_inaddr.sin_port = htons(udp_port);
+	receiver_inaddr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+	if ((receiver_fd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+		printf("create socket failed\n");
+		return -1;
+	}
+
+	printf("Trying to connect...\n");
+
+	if (bind(receiver_fd, (struct sockaddr *)&receiver_inaddr, sizeof(receiver_inaddr)) < 0) {
+		printf("bind failed\n");
+		return -1;
+	}
+
+	printf("connected to server!\n");
+#endif /* __PX4_NUTTX */
+
+	return 0;
+}
+
+int UDP_conn::init_sender(uint16_t udp_port)
+{
+#ifndef __PX4_NUTTX
+
+	if ((sender_fd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+		printf("create socket failed\n");
+		return -1;
+	}
+
+	memset((char *) &sender_outaddr, 0, sizeof(sender_outaddr));
+	sender_outaddr.sin_family = AF_INET;
+	sender_outaddr.sin_port = htons(udp_port);
+
+	if (inet_aton("127.0.0.1", &sender_outaddr.sin_addr) == 0) {
+		printf("inet_aton() failed\n");
+		return -1;
+	}
+
+#endif /* __PX4_NUTTX */
+
+	return 0;
+}
+
+uint8_t UDP_conn::close()
+{
+#ifndef __PX4_NUTTX
+
+	if (sender_fd != -1) {
+		printf("Close sender socket\n");
+		shutdown(sender_fd, SHUT_RDWR);
+		::close(sender_fd);
+		sender_fd = -1;
+	}
+
+	if (receiver_fd != -1) {
+		printf("Close receiver socket\n");
+		shutdown(receiver_fd, SHUT_RDWR);
+		::close(receiver_fd);
+		receiver_fd = -1;
+	}
+
+#endif /* __PX4_NUTTX */
+	return 0;
+}
+
+ssize_t UDP_conn::read(void *buffer, size_t len)
+{
+	if (nullptr == buffer || !fds_OK()) {
+		return -1;
+	}
+
+	int ret = 0;
+#ifndef __PX4_NUTTX
+	// Non Blocking call
+	static socklen_t addrlen = sizeof(receiver_outaddr);
+	ret = recvfrom(receiver_fd, buffer, len, MSG_DONTWAIT, (struct sockaddr *) &receiver_outaddr, &addrlen);
+#endif /* __PX4_NUTTX */
+	return ret;
+}
+
+ssize_t UDP_conn::write(void *buffer, size_t len)
+{
+	if (nullptr == buffer || !fds_OK()) {
+		return -1;
+	}
+
+	int ret = 0;
+#ifndef __PX4_NUTTX
+	ret = sendto(sender_fd, buffer, len, 0, (struct sockaddr *)&sender_outaddr, sizeof(sender_outaddr));
+#endif /* __PX4_NUTTX */
+	return ret;
+}
+
+static void usage()
+{
+	PRINT_MODULE_USAGE_NAME("protocol_splitter", "communication");
+	PRINT_MODULE_USAGE_COMMAND("start");
+
+	PRINT_MODULE_USAGE_PARAM_STRING('t', "UART", "UART|UDP", "Transport protocol", true);
+	PRINT_MODULE_USAGE_PARAM_STRING('d', "/dev/ttyACM0", "<file:dev>", "Select Serial Device", true);
+	PRINT_MODULE_USAGE_PARAM_INT('m', 15554, 0, 65536, "Mavlink bind port", true);
+	PRINT_MODULE_USAGE_PARAM_INT('M', 15555, 0, 65536, "Mavlink remote port", true);
+	PRINT_MODULE_USAGE_PARAM_INT('r', 14444, 0, 65536, "RTPS_client bind port", true);
+	PRINT_MODULE_USAGE_PARAM_INT('R', 14445, 0, 65536, "RTPS_client remote port", true);
+	PRINT_MODULE_USAGE_PARAM_INT('f', 14557, 0, 65536, "FCU bind port", true);
+	PRINT_MODULE_USAGE_PARAM_INT('F', 14540, 0, 65536, "FCU remorte port", true);
+	PRINT_MODULE_USAGE_COMMAND("stop");
+	PRINT_MODULE_USAGE_COMMAND("status");
+}
+
+static int parse_options(int argc, char *argv[])
+{
+	int ch;
+	int myoptind = 1;
+	const char *myoptarg = nullptr;
+
+	while ((ch = px4_getopt(argc, argv, "t:d:m:M:r:R:f:F:", &myoptind, &myoptarg)) != EOF) {
+		switch (ch) {
+		case 't': _options.transport      = strcmp(myoptarg, "UDP") == 0 ?
+							    options::eTransports::UDP
+							    : options::eTransports::UART;      break;
+
+		case 'd': if (nullptr != myoptarg) strcpy(_options.device, myoptarg); break;
+
+		case 'm': _options.mavlink_bind_port = strtol(myoptarg, nullptr, 10);    break;
+
+		case 'M': _options.mavlink_remote_port = strtol(myoptarg, nullptr, 10);    break;
+
+		case 'r': _options.rtps_bind_port   = strtol(myoptarg, nullptr, 10);    break;
+
+		case 'R': _options.rtps_remote_port  = strtoul(myoptarg, nullptr, 10);     break;
+
+		case 'f': _options.fcu_bind_port        = strtol(myoptarg, nullptr, 10);      break;
+
+		case 'F': _options.fcu_remote_port      = strtoul(myoptarg, nullptr, 10);     break;
+
+		default:
+			usage();
+			return -1;
+		}
+	}
+
+	return 0;
+}
+void* t_send(void *data)
+{
+	while (udpPorts) {
+		//TODO: Read from RTPS and mavlink ports
+		// send it to fcu remote port
+		uint8_t buffer[1024];
+		ssize_t len = udpPorts->mav_udp->read(buffer, 1024);
+		if (len > 0) {
+			udpPorts->fcu_udp->write(buffer, len);
+		}
+		len = udpPorts->rtps_udp->read(buffer, 1024);
+		if (len > 0) {
+			udpPorts->fcu_udp->write(buffer, len);
+		}
+	}
+	return nullptr;
+
+}
+bool isRTPS(uint8_t *buffer, ssize_t len)
+{
+	ssize_t header_size = sizeof(struct Header);
+	if (len < header_size)
+		return false;
+	uint32_t msg_start_pos = 0;
+	for (msg_start_pos = 0; msg_start_pos <= (uint32_t)(len - header_size); ++msg_start_pos) {
+		if ('>' == buffer[msg_start_pos] && memcmp(buffer + msg_start_pos, ">>>", 3) == 0) {
+			break;
+		}
+	}
+	if (msg_start_pos > (uint32_t)(len - header_size))
+		return false;
+	return true;
+}
+void* t_receive(void *data)
+{
+	while (udpPorts) {
+		//TODO: Read from fcu bind port
+		uint8_t buffer[1024];
+		ssize_t len = udpPorts->fcu_udp->read(buffer, 1024);
+		if (len > 0) {
+			//parse the content
+			//send it respective port either mavlink or rtps
+			if (isRTPS(&buffer[0], len))
+				udpPorts->rtps_udp->write(buffer, len);
+			else
+				udpPorts->mav_udp->write(buffer, len);
+		}
+	}
+	return nullptr;
+}
+
+static int launch_thread(pthread_t &this_thread, void* (*fun) (void *))
+{
+    pthread_attr_t this_thread_attr;
+    pthread_attr_init(&this_thread_attr);
+    pthread_attr_setstacksize(&this_thread_attr, PX4_STACK_ADJUSTED(4000));
+    struct sched_param param;
+    (void)pthread_attr_getschedparam(&this_thread_attr, &param);
+    param.sched_priority = SCHED_PRIORITY_DEFAULT;
+    (void)pthread_attr_setschedparam(&this_thread_attr, &param);
+    pthread_create(&this_thread, &this_thread_attr, fun, nullptr);
+    pthread_attr_destroy(&this_thread_attr);
+
+    return 0;
+}
+int protocol_splitter_main(int argc, char *argv[])
+{
+	pthread_t sender_thread;
+	pthread_t receive_thread;
+	if (argc < 2) {
+		usage();
+		return -1;
+	}
 	if (!strcmp(argv[1], "start")) {
-		if (objects) {
+		if (objects || udpPorts) {
 			PX4_ERR("already running");
 			return 1;
 		}
-
-		if (argc != 3) {
-			goto out;
-		}
-
-		objects = new StaticData();
-
-		if (!objects) {
-			PX4_ERR("alloc failed");
+		if (0 > parse_options(argc, argv)) {
 			return -1;
 		}
 
-		strncpy(objects->device_name, argv[2], sizeof(objects->device_name));
-		sem_init(&objects->r_lock, 1, 1);
-		sem_init(&objects->w_lock, 1, 1);
-		objects->read_buffer = new ReadBuffer();
-		objects->mavlink2 = new Mavlink2Dev(objects->read_buffer);
-		objects->rtps = new RtpsDev(objects->read_buffer);
+		switch (_options.transport) {
+		case options::eTransports::UART: {
+			objects = new StaticData();
 
-		if (!objects->mavlink2 || !objects->rtps) {
-			delete objects->mavlink2;
-			delete objects->rtps;
-			delete objects->read_buffer;
-			sem_destroy(&objects->r_lock);
-			sem_destroy(&objects->w_lock);
-			delete objects;
-			objects = nullptr;
-			PX4_ERR("alloc failed");
+			if (!objects) {
+				PX4_ERR("alloc failed");
+				return -1;
+			}
+
+			strncpy(objects->device_name, _options.device, sizeof(objects->device_name));
+			sem_init(&objects->r_lock, 1, 1);
+			sem_init(&objects->w_lock, 1, 1);
+			objects->read_buffer = new ReadBuffer();
+			objects->mavlink2 = new Mavlink2Dev(objects->read_buffer);
+			objects->rtps = new RtpsDev(objects->read_buffer);
+
+			if (!objects->mavlink2 || !objects->rtps) {
+				delete objects->mavlink2;
+				delete objects->rtps;
+				delete objects->read_buffer;
+				sem_destroy(&objects->r_lock);
+				sem_destroy(&objects->w_lock);
+				delete objects;
+				objects = nullptr;
+				PX4_ERR("alloc failed");
+				return -1;
+
+			} else {
+				objects->mavlink2->init();
+				objects->rtps->init();
+				}
+	
+			}
+			break;
+		case options::eTransports::UDP: {
+			udpPorts = new UdpPorts();
+			//TODO: initialize UDP_conns
+			udpPorts->mav_udp = new UDP_conn(_options.mavlink_bind_port, _options.mavlink_remote_port);
+			udpPorts->rtps_udp = new UDP_conn(_options.rtps_bind_port, _options.rtps_remote_port);
+			udpPorts->fcu_udp = new UDP_conn(_options.fcu_bind_port, _options.fcu_remote_port);
+			if ((0 > udpPorts->mav_udp->init()) || (0 > udpPorts->rtps_udp->init()) || (0 > udpPorts->fcu_udp->init())) {
+				delete udpPorts->mav_udp;
+				delete udpPorts->rtps_udp;
+				delete udpPorts->fcu_udp;
+				delete udpPorts;
+				udpPorts = nullptr;
+				return -1;
+			}
+			else {
+				launch_thread(sender_thread, t_send);
+				launch_thread(receive_thread, t_receive);
+			}
+			}
+			break;
+		default:
+			usage();
 			return -1;
-
-		} else {
-			objects->mavlink2->init();
-			objects->rtps->init();
 		}
 	}
 
@@ -599,13 +934,22 @@ int protocol_splitter_main(int argc, char *argv[])
 			delete objects;
 			objects = nullptr;
 		}
+		if (udpPorts) {
+			delete udpPorts->mav_udp;
+			delete udpPorts->rtps_udp;
+			delete udpPorts->fcu_udp;
+			delete udpPorts;
+			udpPorts = nullptr;
+			pthread_join(sender_thread, nullptr);
+			pthread_join(receive_thread, nullptr);
+		}
 	}
 
 	/*
 	 * Print driver status.
 	 */
 	if (!strcmp(argv[1], "status")) {
-		if (objects) {
+		if (objects || udpPorts) {
 			PX4_INFO("running");
 
 		} else {
@@ -614,8 +958,4 @@ int protocol_splitter_main(int argc, char *argv[])
 	}
 
 	return 0;
-
-out:
-	PX4_ERR("unrecognized command, try 'start <device>', 'stop', 'status'");
-	return 1;
 }
