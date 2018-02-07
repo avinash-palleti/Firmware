@@ -220,20 +220,23 @@ DevCommon::~DevCommon()
 
 int DevCommon::ioctl(struct file *filp, int cmd, unsigned long arg)
 {
+#ifdef __PX4_NUTTX
 	//pretend we have enough space left to write, so mavlink will not drop data and throw off
 	//our parsing state
 	if (cmd == FIONSPACE) {
 		*(int *)arg = 1024;
 		return 0;
 	}
-
+#endif
 	return ::ioctl(_fd, cmd, arg);
 }
 
 int DevCommon::open(file *filp)
 {
+#ifdef __PX4_NUTTX
 	_fd = ::open(objects->device_name, O_RDWR | O_NOCTTY);
 	CDev::open(filp);
+#endif
 	return _fd >= 0 ? 0 : -1;
 }
 
@@ -242,7 +245,9 @@ int DevCommon::close(file *filp)
 	//int ret = ::close(_fd); // FIXME: calling this results in a dead-lock, because DevCommon::close()
 	// is called from within another close(), and NuttX seems to hold a semaphore at this point
 	_fd = -1;
+#ifdef __PX4_NUTTX
 	CDev::close(filp);
+#endif
 	return 0;
 }
 
@@ -390,6 +395,7 @@ ssize_t Mavlink2Dev::write(struct file *filp, const char *buffer, size_t buflen)
 	 * - a single write call does not contain multiple (or parts of multiple) packets
 	 */
 	ssize_t ret = 0;
+#ifdef __PX4_NUTTX
 
 	switch (_parser_state) {
 	case ParserState::Idle:
@@ -443,6 +449,7 @@ ssize_t Mavlink2Dev::write(struct file *filp, const char *buffer, size_t buflen)
 
 		break;
 	}
+#endif
 
 	return ret;
 }
@@ -534,6 +541,7 @@ ssize_t RtpsDev::write(struct file *filp, const char *buffer, size_t buflen)
 	 * - a single write call does not contain multiple (or parts of multiple) packets
 	 */
 	ssize_t ret = 0;
+#ifdef __PX4_NUTTX
 	uint16_t payload_len;
 
 	switch (_parser_state) {
@@ -575,7 +583,7 @@ ssize_t RtpsDev::write(struct file *filp, const char *buffer, size_t buflen)
 
 		break;
 	}
-
+#endif
 	return ret;
 }
 
@@ -866,6 +874,7 @@ int protocol_splitter_main(int argc, char *argv[])
 
 		switch (_options.transport) {
 		case options::eTransports::UART: {
+#ifdef __PX4_NUTTX
 			objects = new StaticData();
 
 			if (!objects) {
@@ -895,6 +904,7 @@ int protocol_splitter_main(int argc, char *argv[])
 				objects->mavlink2->init();
 				objects->rtps->init();
 				}
+#endif
 	
 			}
 			break;
@@ -925,6 +935,7 @@ int protocol_splitter_main(int argc, char *argv[])
 	}
 
 	if (!strcmp(argv[1], "stop")) {
+#ifdef __PX4_NUTTX
 		if (objects) {
 			delete objects->mavlink2;
 			delete objects->rtps;
@@ -934,6 +945,7 @@ int protocol_splitter_main(int argc, char *argv[])
 			delete objects;
 			objects = nullptr;
 		}
+#endif
 		if (udpPorts) {
 			delete udpPorts->mav_udp;
 			delete udpPorts->rtps_udp;
