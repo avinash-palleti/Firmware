@@ -42,6 +42,7 @@ endif()
 
 set(config_rtps_send_topics
    sensor_combined
+   home_position
    )
 
 set(config_rtps_receive_topics
