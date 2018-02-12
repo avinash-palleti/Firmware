@@ -790,6 +790,7 @@ static int parse_options(int argc, char *argv[])
 
 	return 0;
 }
+
 void* t_send(void *data)
 {
 	while (udpPorts) {
@@ -808,6 +809,7 @@ void* t_send(void *data)
 	return nullptr;
 
 }
+
 bool isRTPS(uint8_t *buffer, ssize_t len)
 {
 	ssize_t header_size = sizeof(struct Header);
@@ -823,6 +825,7 @@ bool isRTPS(uint8_t *buffer, ssize_t len)
 		return false;
 	return true;
 }
+
 void* t_receive(void *data)
 {
 	while (udpPorts) {
@@ -855,6 +858,7 @@ static int launch_thread(pthread_t &this_thread, void* (*fun) (void *))
 
     return 0;
 }
+
 int protocol_splitter_main(int argc, char *argv[])
 {
 	pthread_t sender_thread;
@@ -961,12 +965,12 @@ int protocol_splitter_main(int argc, char *argv[])
 	 * Print driver status.
 	 */
 	if (!strcmp(argv[1], "status")) {
-		if (objects || udpPorts) {
-			PX4_INFO("running");
-
-		} else {
-			PX4_INFO("not running");
-		}
+		if (objects)
+			PX4_INFO("Running on serial port");
+		else if (udpPorts)
+			PX4_INFO("Running on UDP port");
+		else
+			PX4_INFO("Not running");
 	}
 
 	return 0;
